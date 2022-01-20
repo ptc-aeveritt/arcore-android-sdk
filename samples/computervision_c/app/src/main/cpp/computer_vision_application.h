@@ -17,14 +17,18 @@
 #ifndef C_ARCORE_COMPUTER_VISION_APPLICATION_H_
 #define C_ARCORE_COMPUTER_VISION_APPLICATION_H_
 
+#include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #include <android/asset_manager.h>
 #include <jni.h>
+
+#include <atomic>
 #include <memory>
 #include <mutex>  // NOLINT
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -126,6 +130,21 @@ class ComputerVisionApplication {
   void getCameraConfigLowestAndHighestResolutions(
       CameraConfig** lowest_resolution_config,
       CameraConfig** highest_resolution_config);
+
+  jobject mActivity;
+
+  EGLSurface mEGLSurface;
+  EGLContext mEGLContext;
+  EGLDisplay mEGLDisplay;
+  GLuint mCameraTargetTexture;
+
+  std::atomic<bool> mWorkerRunning{true};
+  std::thread mWorker;
+
+  bool CreateEGLContext();
+
+  void DoUpdate(JNIEnv* env);
+
 };
 }  // namespace computer_vision
 

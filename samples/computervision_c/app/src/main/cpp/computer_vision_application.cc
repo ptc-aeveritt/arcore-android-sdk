@@ -20,7 +20,10 @@
 #include <iomanip>
 #include <sstream>
 
+#include "jni_interface.h"
 #include "util.h"
+
+#define UPDATE_IN_BACKGROUND 1
 
 namespace computer_vision {
 namespace {
@@ -67,6 +70,10 @@ ComputerVisionApplication::~ComputerVisionApplication() {
 
 void ComputerVisionApplication::OnPause() {
   LOGI("OnPause()");
+#if UPDATE_IN_BACKGROUND
+  mWorkerRunning = false;
+  mWorker.join();
+#endif
   if (ar_session_ != nullptr) {
     ArSession_pause(ar_session_);
   }
@@ -76,6 +83,7 @@ void ComputerVisionApplication::OnResume(JNIEnv* env, jobject context,
                                          jobject activity) {
   LOGI("OnResume()");
 
+#if !UPDATE_IN_BACKGROUND
   if (ar_session_ == nullptr) {
     ArInstallStatus install_status;
     // If install was not yet requested, that means that we are resuming the
@@ -125,6 +133,17 @@ void ComputerVisionApplication::OnResume(JNIEnv* env, jobject context,
 
   const ArStatus status = ArSession_resume(ar_session_);
   CHECKANDTHROW(status == AR_SUCCESS, env, "Failed to resume AR session.");
+
+#else
+  mActivity = env->NewGlobalRef(activity);
+
+  mWorker = std::thread([this]()
+  {
+    JNIEnv* env = GetJniEnv();
+    assert(env);
+    this->DoUpdate(env);
+  });
+#endif
 }
 
 void ComputerVisionApplication::OnSurfaceCreated() {
@@ -154,6 +173,7 @@ void ComputerVisionApplication::OnDrawFrame(float split_position) {
 
   if (ar_session_ == nullptr) return;
 
+#if !UPDATE_IN_BACKGROUND
   ArSession_setCameraTextureName(ar_session_,
                                  cpu_image_renderer_.GetTextureId());
 
@@ -179,6 +199,7 @@ void ComputerVisionApplication::OnDrawFrame(float split_position) {
   cpu_image_renderer_.Draw(ar_session_, ar_frame_, image, aspect_ratio_,
                            camera_to_display_rotation_, split_position);
   ArImage_release(image);
+#endif
 }
 
 std::string ComputerVisionApplication::getCameraConfigLabel(
@@ -238,7 +259,13 @@ void ComputerVisionApplication::SetFocusMode(bool enable_auto_focus) {
 }
 
 bool ComputerVisionApplication::GetFocusMode() {
+#if !UPDATE_IN_BACKGROUND
   CHECK(ar_session_);
+#else
+  if (ar_session_ == nullptr) {
+    return false;
+  }
+#endif
   CHECK(ar_config_);
 
   ArFocusMode focus_mode;
@@ -386,6 +413,141 @@ std::string ComputerVisionApplication::GetCameraIntrinsicsText(
                   << fov_y << "º)";
 
   return intrinsics_text.str();
+}
+
+bool ComputerVisionApplication::CreateEGLContext()
+{
+  // Gather all the EGL+GLES errors to this variable to
+  // make clean up easier.
+  bool glesInitFailed = false;
+
+  mEGLDisplay = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+  eglInitialize(mEGLDisplay, 0, 0);
+  eglBindAPI(EGL_OPENGL_ES_API);
+
+  std::vector<EGLint> chooseConfigAttribs = {
+          EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
+          EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+          EGL_BLUE_SIZE, 8,
+          EGL_GREEN_SIZE, 8,
+          EGL_RED_SIZE, 8,
+          EGL_ALPHA_SIZE, 8,
+          EGL_NONE
+  };
+  EGLConfig eglConfig = nullptr;
+  EGLint numConfigs = 0;
+  EGLBoolean res = eglChooseConfig(mEGLDisplay, chooseConfigAttribs.data(), &eglConfig, 1, &numConfigs);
+
+#if 1
+  // Just create a dummy 1x1 pbuffer as we won't be rendering into it.
+  std::vector<EGLint> PBufferSurfaceAttribs = {
+          EGL_WIDTH, static_cast<int> (1),
+          EGL_HEIGHT, static_cast<int> (1),
+          EGL_NONE
+  };
+#else
+  // Try setting this to the 'right' size
+  // No observable difference in memory growth
+  std::vector<EGLint> PBufferSurfaceAttribs = {
+          EGL_WIDTH, static_cast<int> (width_),
+          EGL_HEIGHT, static_cast<int> (height_),
+          EGL_NONE
+  };
+#endif
+  mEGLSurface = eglCreatePbufferSurface(mEGLDisplay, eglConfig, PBufferSurfaceAttribs.data());
+
+  // Default to GLES2 as we don't need any GLES3 functions as we now
+  // get the camera frame from the cpu
+  std::vector<EGLint> contextAttribs = {
+          EGL_CONTEXT_CLIENT_VERSION, 2,
+          EGL_NONE
+  };
+  mEGLContext = eglCreateContext(mEGLDisplay, eglConfig, EGL_NO_CONTEXT, contextAttribs.data());
+  res = eglMakeCurrent(mEGLDisplay, mEGLSurface, mEGLSurface, mEGLContext);
+  glesInitFailed |= (res != EGL_TRUE);
+  glesInitFailed |= (eglGetError() != EGL_SUCCESS);
+
+  LOGI("CreateEGLContext %s", glesInitFailed ? "FAILED" : "SUCCESS");
+  return !glesInitFailed;
+}
+
+void ComputerVisionApplication::DoUpdate(JNIEnv* env)
+{
+  LOGI("DoUpdate");
+
+  CreateEGLContext();
+
+  if (ar_session_ != nullptr) {
+    LOGE("ar_session_ should be nullptr");
+    assert(false);
+  } else {
+    CHECKANDTHROW(ArSession_create(env, mActivity, &ar_session_) == AR_SUCCESS,
+                  env, "Failed to create AR session.");
+    CHECK(ar_session_);
+
+    ArConfig_create(ar_session_, &ar_config_);
+    CHECK(ar_config_);
+
+    ArConfig_setUpdateMode(ar_session_, ar_config_, AR_UPDATE_MODE_BLOCKING);
+    CHECK(ArSession_configure(ar_session_, ar_config_) == AR_SUCCESS);
+
+    ArFrame_create(ar_session_, &ar_frame_);
+    CHECK(ar_frame_);
+
+    obtainCameraConfigs();
+
+    ArCameraIntrinsics_create(ar_session_, &ar_camera_intrinsics_);
+    CHECK(ar_camera_intrinsics_);
+
+    ArSession_setDisplayGeometry(ar_session_, display_rotation_, width_,
+                                 height_);
+  }
+
+  const ArStatus status = ArSession_resume(ar_session_);
+  if (status != AR_SUCCESS) {
+    LOGE("ArSession_resume failed");
+    assert(false);
+    return;
+  }
+
+  // Create the texture for ARCore
+  GLuint textures[1];
+  glGenTextures(2, textures);
+
+  auto camera_texture_id_ = textures[0];
+  glBindTexture(GL_TEXTURE_EXTERNAL_OES, camera_texture_id_);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+  ArSession_setCameraTextureName(ar_session_, camera_texture_id_);
+
+  LOGI("Starting update loop");
+  int count = 0;
+  int64_t lastTimestamp = 0;
+  while (mWorkerRunning) {
+    // Update session to get current frame
+    if (ArSession_update(ar_session_, ar_frame_) != AR_SUCCESS) {
+      LOGE("ComputerVisionApplication::DoUpdate ArSession_update error");
+      std::this_thread::sleep_for(std::chrono::milliseconds(15));
+    } else {
+      int64_t timestamp = 0;
+      ArFrame_getTimestamp(ar_session_, ar_frame_, &timestamp);
+      if (timestamp == 0 || timestamp <= lastTimestamp) {
+        LOGI("ComputerVisionApplication::DoUpdate ArSession_update didn't provide a new frame");
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+      } else {
+        lastTimestamp = timestamp;
+      }
+    }
+
+    ++count;
+    if (count % 60 == 0) {
+      LOGI("Update loop heartbeat");
+    }
+  }
+
 }
 
 }  // namespace computer_vision

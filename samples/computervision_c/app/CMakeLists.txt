@@ -46,5 +46,6 @@ target_link_libraries(computer_vision_native
                       mediandk
                       log
                       GLESv2
+                      EGL
                       glm
                       arcore)
